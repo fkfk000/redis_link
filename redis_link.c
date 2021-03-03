@@ -84,17 +84,26 @@ typedef struct redisCtx
     double rows;
 } redisCtx;
 
+
+enum operand_direction
+{
+    direction_left,
+    direction_right
+};
+
 // Helper function declaration
 static bool redis_is_valid_option(const char *option_name, Oid option_typpe);
 void set_redis_ctx(Oid foreigntableid, redisCtx *redis_ctx);
 void set_where_claus(RelOptInfo *baserel, redisCtx *redis_ctx, List *baserestrictinfo);
+bool is_valid_key_type(Oid key_type);
+Oid get_operand_type(OpExpr *expr, operand_direction direction);
+
 
 
 
 // Declaration of functions
 void redisLinkGetForeignRelSize(PlannerInfo *root,
                                 RelOptInfo *baserel, Oid foreigntableid);
-
 
 
 // Declaration of macros
@@ -160,6 +169,42 @@ Datum redis_link_validator(PG_FUNCTION_ARGS)
 
 */
 
+
+bool is_valid_key_type(Oid key_type)
+{
+    if (key_type == TEXTOID || key_type == CHAROID || key_type == BPCHAROID || key_type == VARCHAROID)
+    {
+        return true;
+    }
+    return false;
+}
+
+
+Oid get_operand_type(OpExpr *expr, operand_direction direction)
+{
+    HeapTuple tuple;
+    Form_pg_operator form;
+    Oid operand_type;
+    tuple = SearchSysCache1(OPEROID, ObjectIdGetDatum(expr->opno));
+    if (!HeapTupleIsValid(tuple))
+    {
+        elog(ERROR, "ERROR when look up for system cache for get_left_type");
+    }
+    form = (Form_pg_operator) GETSTRUCT(tuple);
+    if(direction == direction_left)
+    {
+        operand_type = form->oprleft;
+    }
+    else
+    {
+        operand_type = form->oprright;
+    }
+    
+    ReleaseSysCache(tuple);
+    return operand_type;
+}
+
+
 // This function will set the proper values for redis_ctx and try to connect to redis.
 void set_redis_ctx(Oid foreigntableid, redisCtx *redis_ctx)
 {
@@ -189,28 +234,32 @@ void set_redis_ctx(Oid foreigntableid, redisCtx *redis_ctx)
             elog(ERROR, "run into unknow database configuration. def is %s", def->defname);
         }
     }
-    if(redis_ctx->host == NULL)
+    if (redis_ctx->host == NULL)
     {
         int len_locahost = strlen("localhost");
-        redis_ctx->host = palloc(len_locahost+1);
+        redis_ctx->host = palloc(len_locahost + 1);
         memcpy(redis_ctx->host, "localhost", len_locahost);
         redis_ctx->host[len_locahost] = '\0';
     }
     redis_ctx->connection_context = redisConnect(redis_ctx->host, redis_ctx->port);
-    if(redis_ctx->connection_context == NULL)
+    if (redis_ctx->connection_context == NULL)
     {
         elog(ERROR, "Could not connect to redis server");
     }
 }
 
-
-
-
 // This function is to parse where claus for keys in select statements.
 // for value or ttl, we don't do this because in this situation, we need to retrive all the tuples.
 void set_where_claus(RelOptInfo *baserel, redisCtx *redis_ctx, List *baserestrictinfo)
 {
-
+    if (baserestrictinfo == NULL)
+    {
+        return;
+    }
+    if (list_length(baserestrictinfo) > 1)
+    {
+        elog(ERROR, "sorry, currently we only support on where clues")
+    }
 }
 
 /* Here is the main part of the programme
@@ -222,7 +271,6 @@ void set_where_claus(RelOptInfo *baserel, redisCtx *redis_ctx, List *baserestric
 
 
 */
-
 
 // Base for any other function and get realtion size
 void redisLinkGetForeignRelSize(PlannerInfo *root,
@@ -243,17 +291,12 @@ void redisLinkGetForeignRelSize(PlannerInfo *root,
     baserel->tuples = size;
     if (root->parse->commandType == CMD_SELECT)
     {
-
     }
     else
     {
         elog(ERROR, "Sorry, we don't support command beyond select right now");
     }
-    
 }
-
-
-
 
 Datum redis_link_handler(PG_FUNCTION_ARGS)
 {

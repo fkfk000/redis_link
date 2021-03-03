@@ -1,0 +1,4 @@
+comment = 'foreign-data test wrapper for Redis'
+default_version = '1.0'
+module_pathname = '$libdir/redis_link'
+relocatable = true

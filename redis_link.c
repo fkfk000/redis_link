@@ -66,6 +66,8 @@ PG_MODULE_MAGIC;
 
 */
 
+#define MAX_CACHED_MEMORY 8 * 1024 * 1024 // 8MB
+
 // For now, we actually only support string.
 enum REDIS_TABLE_TYPE
 {
@@ -73,6 +75,23 @@ enum REDIS_TABLE_TYPE
     REDIS_TABLE_STRING,
     REDIS_TABLE_HSET
 };
+
+typedef struct redisColumn
+{
+    char *column_name;
+    int attnum;
+    Oid atttypid;
+    Oid atttypmod;
+    regproc typoutput; // type output conversion function
+    regproc typinput;  // type input conversion function
+} redisColumn;
+
+typedef struct redisTableInfo
+{
+    char *tablename;
+    int column_num;
+    redisColumn *columns;
+} redisTableInfo;
 
 typedef struct redisCtx
 {
@@ -86,6 +105,7 @@ typedef struct redisCtx
     ForeignTable *foreign_table;
     int table_type;
     char *prefix_name;
+    redisTableInfo *table_info;
 
     // redis related object.
     redisContext *connection_context;
@@ -115,6 +135,22 @@ typedef struct redisScanState
 
 } redisScanState;
 
+typedef struct redisInsertState
+{
+    redisCtx *redis_ctx;
+    int current_buffered_data; // how much data is cached.
+    int cached_cmd;            // how many redisAppendCommand is memory.
+    redisReply *iter_reply;    // used for consume the retruned value from redisAppendCommand.
+    AttInMetadata *attmeta;    // description of the tuple.
+    MemoryContext tmp_context; // used in each iter of insert.
+
+    // used for sotore values from slot.
+    // we used use them in tmp context, keep them shot-lived.
+    char *key;
+    char *value;
+    char *ttl;
+} redisInsertState;
+
 // current we only support these.
 enum REDIS_WHERE_OP
 {
@@ -126,6 +162,8 @@ enum REDIS_WHERE_OP
 // Helper function declaration
 static bool redis_is_valid_option(const char *option_name, Oid option_typpe);
 void set_redis_ctx(Oid foreigntableid, redisCtx *redis_ctx);
+void set_redis_table_column(Oid foreigntableid, redisCtx *redis_ctx);
+void set_type_inout_function(Oid typeid, regproc *typinput, regproc *typoutput);
 void set_where_clause(RelOptInfo *baserel, redisCtx *redis_ctx, List *baserestrictinfo);
 bool is_valid_key_type(Oid key_type);
 void get_operation_infromation(OpExpr *expr, Oid *left_oid, Oid *rght_oid, Oid *operation_type);
@@ -144,9 +182,30 @@ ForeignScan *redisLinkGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
                                      List *tlist, List *scan_clauses, Plan *outer_plan);
 
 void redisLinkBeginForeignScan(ForeignScanState *node, int eflags);
-TupleTableSlot *redisLinkIterateForeignScan(ForeignScanState *node);
-void redisLinkReScanForeignScan(ForeignScanState *node);
-void redisLinkEndForeignScan(ForeignScanState *node);
+static TupleTableSlot *redisLinkIterateForeignScan(ForeignScanState *node);
+static void redisLinkReScanForeignScan(ForeignScanState *node);
+static void redisLinkEndForeignScan(ForeignScanState *node);
+static List *redisLinkPlanForeignModify(PlannerInfo *root, ModifyTable *plan,
+                                        Index resultRelation,
+                                        int subplan_index);
+static TupleTableSlot *redisLinkExecForeignInsert(EState *estate,
+                                                  ResultRelInfo *rinfo,
+                                                  TupleTableSlot *slot,
+                                                  TupleTableSlot *planSlot);
+
+static void redisLinkBeginForeignModify(ModifyTableState *mtstate,
+                                        ResultRelInfo *rinfo,
+                                        List *fdw_private,
+                                        int subplan_index,
+                                        int eflags);
+static void redisLinkEndForeignModify(EState *estate,
+                                      ResultRelInfo *rinfo);
+
+static void redisLinkBeginForeignInsert(ModifyTableState *mtstate,
+                                        ResultRelInfo *rinfo);
+
+static void redisLinkEndForeignInsert(EState *estate,
+                                      ResultRelInfo *rinfo);
 
 // Declaration of macros
 #define OPT_KEY "key"
@@ -155,6 +214,7 @@ void redisLinkEndForeignScan(ForeignScanState *node);
 #define OPT_COLUMN "column"
 #define OPT_TABLE_TYPE "tabletype"
 #define OPT_PREFIX_NAME "prefixname"
+#define OPT_HOST "host"
 
 // Declaration of various structs
 
@@ -172,6 +232,7 @@ static redis_various_option redis_avaliable_options[] = {
     {OPT_TTL, ForeignTableRelidIndexId},
     {OPT_COLUMN, AttributeRelationId},
     {OPT_TABLE_TYPE, ForeignTableRelationId},
+    {OPT_HOST, ForeignTableRelationId},
     // This is for iteration
     {NULL, InvalidOid}};
 
@@ -295,6 +356,7 @@ void set_redis_ctx(Oid foreigntableid, redisCtx *redis_ctx)
     redis_ctx->foreign_server = GetForeignServer(redis_ctx->foreign_table->serverid);
     redis_ctx->table_type = REDIS_TABLE_INVALID;
     redis_ctx->host = NULL;
+    redis_ctx->table_info = (redisTableInfo *)palloc(sizeof(redisTableInfo));
     List *options = redis_ctx->foreign_table->options;
     ListCell *lc;
     redis_ctx->port = 6379;
@@ -354,6 +416,45 @@ void set_redis_ctx(Oid foreigntableid, redisCtx *redis_ctx)
     {
         elog(ERROR, "Could not connect to redis server");
     }
+    set_redis_table_column(foreigntableid, redis_ctx);
+}
+
+// For now, we just record all the
+void set_redis_table_column(Oid foreigntableid, redisCtx *redis_ctx)
+{
+    //elog(INFO, "*** %s", __FUNCTION__);
+    Relation rel;
+    TupleDesc tupledesc;
+    redisTableInfo *table_info = redis_ctx->table_info;
+    table_info->tablename = get_rel_name(foreigntableid);
+    rel = heap_open(foreigntableid, NoLock);
+    tupledesc = rel->rd_att;
+    table_info->column_num = tupledesc->natts;
+    table_info->columns = (redisColumn *)palloc(table_info->column_num * sizeof(redisColumn));
+    for (int i = 0; i < table_info->column_num; i++)
+    {
+        Form_pg_attribute att = &tupledesc->attrs[i];
+        table_info->columns[i].column_name = pstrdup(NameStr(att->attname));
+        table_info->columns[i].atttypid = att->atttypid;
+        table_info->columns[i].atttypmod = att->atttypmod;
+        set_type_inout_function(table_info->columns[i].atttypid, &table_info->columns[i].typinput, &table_info->columns[i].typoutput);
+    }
+    heap_close(rel, NoLock);
+}
+
+void set_type_inout_function(Oid typeid, regproc *typinput, regproc *typoutput)
+{
+    //elog(INFO, "*** %s", __FUNCTION__);
+    HeapTuple tuple;
+    tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typeid));
+    if (!HeapTupleIsValid(tuple))
+    {
+        elog(ERROR, "ERROR when open the catalog for inout function");
+    }
+    Form_pg_type pg_type = (Form_pg_type)GETSTRUCT(tuple);
+    *typinput = pg_type->typinput;
+    *typoutput = pg_type->typoutput;
+    ReleaseSysCache(tuple);
 }
 
 // parse_where
@@ -638,6 +739,198 @@ void redisLinkEndForeignScan(ForeignScanState *node)
     redisFree(redis_scan_state->redis_ctx->connection_context);
 }
 
+static List *redisLinkPlanForeignModify(PlannerInfo *root, ModifyTable *plan,
+                                        Index resultRelation,
+                                        int subplan_index)
+{
+    //elog(INFO, "*** %s", __FUNCTION__);
+    RangeTblEntry *rte;
+    Oid foreigntableid;
+    CmdType cmdtype = plan->operation;
+    if (cmdtype != CMD_INSERT)
+    {
+        elog(ERROR, "Sorry, currently we only support insert operation.");
+    }
+    redisCtx *redis_ctx = (redisCtx *)palloc(sizeof(redisCtx));
+    rte = planner_rt_fetch(resultRelation, root);
+    foreigntableid = rte->relid;
+    set_redis_ctx(foreigntableid, redis_ctx);
+    return (List *)redis_ctx;
+}
+
+static void
+redisLinkBeginForeignModify(ModifyTableState *mtstate,
+                            ResultRelInfo *rinfo,
+                            List *fdw_private,
+                            int subplan_index,
+                            int eflags)
+{
+    //elog(INFO, "*** %s", __FUNCTION__);
+    CmdType operation = mtstate->operation;
+    if (operation != CMD_INSERT)
+    {
+        elog(ERROR, "Sorry, for now we only support insert. beginmodify");
+    }
+    redisCtx *redis_ctx = (redisCtx *)fdw_private;
+    redisInsertState *insert_state = (redisInsertState *)palloc0(sizeof(redisInsertState));
+    insert_state->redis_ctx = redis_ctx;
+    insert_state->tmp_context = AllocSetContextCreate(mtstate->ps.state->es_query_cxt, "redis insert iter tmp memory", ALLOCSET_DEFAULT_SIZES);
+    rinfo->ri_FdwState = (void *)insert_state;
+}
+
+static TupleTableSlot *redisLinkExecForeignInsert(EState *estate,
+                                                  ResultRelInfo *rinfo,
+                                                  TupleTableSlot *slot,
+                                                  TupleTableSlot *planSlot)
+{
+    //elog(INFO, "*** %s", __FUNCTION__);
+    MemoryContext old_context;
+    Datum datum;
+    redisInsertState *insert_info = (redisInsertState *)rinfo->ri_FdwState;
+    redisTableInfo *table_info = insert_info->redis_ctx->table_info;
+    char *key;
+    char *value;
+    char *ttl;
+    int128 ttl_in_long;
+    int iter_redis_reply_status;
+    if (insert_info->attmeta == NULL)
+    {
+        insert_info->attmeta = TupleDescGetAttInMetadata(slot->tts_tupleDescriptor);
+    }
+    old_context = MemoryContextSwitchTo(insert_info->tmp_context);
+    for (int i = 0; i < table_info->column_num; i++)
+    {
+        bool isNull;
+        datum = slot_getattr(slot, i + 1, &isNull);
+        // TODO: we really need to set proper identifier in column instead of 0/1/2.
+        switch (i)
+        {
+        case 0:
+            key = DatumGetCString(OidFunctionCall1(table_info->columns[i].typoutput, datum));
+            break;
+        case 1:
+            value = DatumGetCString(OidFunctionCall1(table_info->columns[i].typoutput, datum));
+            break;
+        case 2:
+            if (isNull)
+            {
+                ttl_in_long = -1;
+            }
+            else
+            {
+                ttl = DatumGetCString(OidFunctionCall1(table_info->columns[i].typoutput, datum));
+                ttl_in_long = atoll(ttl);
+            }
+            break;
+        default:
+            elog(ERROR, "????? we should not be here.");
+            break;
+        }
+    }
+    if (ttl_in_long == -1)
+    {
+        redisAppendCommand(insert_info->redis_ctx->connection_context, "set %s %s", key, value);
+    }
+    else
+    {
+        redisAppendCommand(insert_info->redis_ctx->connection_context, "set %s %s ex %ld", key, value, ttl_in_long);
+    }
+    insert_info->cached_cmd++;
+    insert_info->current_buffered_data += strlen(key) + strlen(value);
+    if (insert_info->current_buffered_data > MAX_CACHED_MEMORY)
+    {
+        while (insert_info->cached_cmd > 0)
+        {
+            iter_redis_reply_status = redisGetReply(insert_info->redis_ctx->connection_context, (void **)&insert_info->iter_reply);
+            if (iter_redis_reply_status == REDIS_ERR)
+            {
+                elog(ERROR, "error during insert iter end");
+            }
+            freeReplyObject(insert_info->iter_reply);
+            insert_info->cached_cmd--;
+        }
+        insert_info->current_buffered_data = 0;
+        MemoryContextReset(CurrentMemoryContext);
+    }
+    MemoryContextSwitchTo(old_context);
+    return slot;
+}
+
+static void
+redisLinkEndForeignModify(EState *estate,
+                          ResultRelInfo *rinfo)
+{
+    //elog(INFO, "*** %s", __FUNCTION__);
+    MemoryContext old_context;
+    int iter_redis_reply_status;
+    redisInsertState *insert_info = (redisInsertState *)rinfo->ri_FdwState;
+    old_context = MemoryContextSwitchTo(insert_info->tmp_context);
+    while (insert_info->cached_cmd > 0)
+    {
+        iter_redis_reply_status = redisGetReply(insert_info->redis_ctx->connection_context, (void **)&insert_info->iter_reply);
+        if (iter_redis_reply_status == REDIS_ERR)
+        {
+            elog(ERROR, "error during insert iter end");
+        }
+        freeReplyObject(insert_info->iter_reply);
+        insert_info->cached_cmd--;
+    }
+    redisFree(insert_info->redis_ctx->connection_context);
+    MemoryContextReset(CurrentMemoryContext);
+    MemoryContextSwitchTo(old_context);
+}
+
+static void
+redisLinkBeginForeignInsert(ModifyTableState *mtstate,
+                            ResultRelInfo *rinfo)
+{
+    //elog(INFO, "*** %s", __FUNCTION__);
+    CmdType operation = mtstate->operation;
+    RangeTblEntry *rte;
+    Index result_table_index;
+    EState *estate;
+    Oid foreigntableid;
+    if (operation != CMD_INSERT)
+    {
+        elog(ERROR, "Sorry, for now we only support insert. beginmodify");
+    }
+    result_table_index = rinfo->ri_RangeTableIndex;
+    estate = mtstate->ps.state;
+    // get the rte of the foreign table.
+    // because we don't support partition table. it seems for now, it is ok.
+    rte = list_nth(estate->es_range_table, result_table_index - 1);
+    foreigntableid = rte->relid;
+    redisCtx *redis_ctx = (redisCtx *)palloc(sizeof(redisCtx));
+    set_redis_ctx(foreigntableid, redis_ctx);
+    redisInsertState *insert_state = (redisInsertState *)palloc0(sizeof(redisInsertState));
+    insert_state->redis_ctx = redis_ctx;
+    insert_state->tmp_context = AllocSetContextCreate(mtstate->ps.state->es_query_cxt, "redis insert iter tmp memory", ALLOCSET_DEFAULT_SIZES);
+    rinfo->ri_FdwState = (void *)insert_state;
+}
+
+static void redisLinkEndForeignInsert(EState *estate,
+                                      ResultRelInfo *rinfo)
+{
+    //elog(INFO, "*** %s", __FUNCTION__);
+    MemoryContext old_context;
+    int iter_redis_reply_status;
+    redisInsertState *insert_info = (redisInsertState *)rinfo->ri_FdwState;
+    old_context = MemoryContextSwitchTo(insert_info->tmp_context);
+    while (insert_info->cached_cmd > 0)
+    {
+        iter_redis_reply_status = redisGetReply(insert_info->redis_ctx->connection_context, (void **)&insert_info->iter_reply);
+        if (iter_redis_reply_status == REDIS_ERR)
+        {
+            elog(ERROR, "error during insert iter end");
+        }
+        freeReplyObject(insert_info->iter_reply);
+        insert_info->cached_cmd--;
+    }
+    redisFree(insert_info->redis_ctx->connection_context);
+    MemoryContextReset(CurrentMemoryContext);
+    MemoryContextSwitchTo(old_context);
+}
+
 Datum redis_link_handler(PG_FUNCTION_ARGS)
 {
     FdwRoutine *froutine = makeNode(FdwRoutine);
@@ -648,5 +941,14 @@ Datum redis_link_handler(PG_FUNCTION_ARGS)
     froutine->IterateForeignScan = redisLinkIterateForeignScan;
     froutine->ReScanForeignScan = redisLinkReScanForeignScan;
     froutine->EndForeignScan = redisLinkEndForeignScan;
+
+    froutine->AddForeignUpdateTargets = NULL; // Currently we only want to support insert.
+    froutine->PlanForeignModify = redisLinkPlanForeignModify;
+    froutine->BeginForeignModify = redisLinkBeginForeignModify;
+    froutine->ExecForeignInsert = redisLinkExecForeignInsert;
+    froutine->EndForeignModify = redisLinkEndForeignModify;
+    froutine->BeginForeignInsert = redisLinkBeginForeignInsert;
+    froutine->EndForeignInsert = redisLinkEndForeignInsert;
+
     PG_RETURN_POINTER(froutine);
 }
